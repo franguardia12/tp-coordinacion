@@ -1,69 +1,32 @@
-import os
 import logging
-import threading
+import os
 
-from common import middleware, message_protocol, fruit_item
+from common.control import positive_setting, replica_queue, run_filter
+from common.message_protocol import internal
+from common.processing import AccumulatingFilter
 
-ID = int(os.environ["ID"])
-MOM_HOST = os.environ["MOM_HOST"]
-INPUT_QUEUE = os.environ["INPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-SUM_CONTROL_EXCHANGE = "SUM_CONTROL_EXCHANGE"
-AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
 
-class SumFilter:
+class SumFilter(AccumulatingFilter):
+
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.data_output_exchanges = []
-        for i in range(AGGREGATION_AMOUNT):
-            data_output_exchange = middleware.MessageMiddlewareExchangeRabbitMQ(
-                MOM_HOST, AGGREGATION_PREFIX, [f"{AGGREGATION_PREFIX}_{i}"]
-            )
-            self.data_output_exchanges.append(data_output_exchange)
-        self.amount_by_fruit = {}
+        if positive_setting("SUM_AMOUNT") != 1:
+            raise ValueError("Multiple Sum replicas require distributed completion")
+        if positive_setting("AGGREGATION_AMOUNT") != 1:
+            raise ValueError("Multiple Aggregation replicas require partitioning")
+        self.destination = replica_queue(os.environ["AGGREGATION_PREFIX"], 0)
+        super().__init__(os.environ["MOM_HOST"], os.environ["INPUT_QUEUE"])
 
-    def _process_data(self, fruit, amount):
-        logging.info(f"Process data")
-        self.amount_by_fruit[fruit] = self.amount_by_fruit.get(
-            fruit, fruit_item.FruitItem(fruit, 0)
-        ) + fruit_item.FruitItem(fruit, int(amount))
+    def finish_query(self, query_id, totals):
+        for item in totals.by_fruit.values():
+            self.send(self.destination, internal.data(query_id, item.fruit, item.amount))
+        # This marker shares the data queue and follows every confirmed partial.
+        self.send(self.destination, internal.eof(query_id, len(totals.by_fruit)))
+        logging.info("Published totals for query %s", query_id)
 
-    def _process_eof(self):
-        logging.info(f"Broadcasting data messages")
-        for final_fruit_item in self.amount_by_fruit.values():
-            for data_output_exchange in self.data_output_exchanges:
-                data_output_exchange.send(
-                    message_protocol.internal.serialize(
-                        [final_fruit_item.fruit, final_fruit_item.amount]
-                    )
-                )
-
-        logging.info(f"Broadcasting EOF message")
-        for data_output_exchange in self.data_output_exchanges:
-            data_output_exchange.send(message_protocol.internal.serialize([]))
-
-
-    def process_data_messsage(self, message, ack, nack):
-        fields = message_protocol.internal.deserialize(message)
-        if len(fields) == 2:
-            self._process_data(*fields)
-        else:
-            self._process_eof(*fields)
-        ack()
-
-    def start(self):
-        self.input_queue.start_consuming(self.process_data_messsage)
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    sum_filter = SumFilter()
-    sum_filter.start()
-    return 0
+    return run_filter(SumFilter)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,45 +1,47 @@
-import os
 import logging
+import os
 
-from common import middleware, message_protocol, fruit_item
-
-MOM_HOST = os.environ["MOM_HOST"]
-INPUT_QUEUE = os.environ["INPUT_QUEUE"]
-OUTPUT_QUEUE = os.environ["OUTPUT_QUEUE"]
-SUM_AMOUNT = int(os.environ["SUM_AMOUNT"])
-SUM_PREFIX = os.environ["SUM_PREFIX"]
-AGGREGATION_AMOUNT = int(os.environ["AGGREGATION_AMOUNT"])
-AGGREGATION_PREFIX = os.environ["AGGREGATION_PREFIX"]
-TOP_SIZE = int(os.environ["TOP_SIZE"])
+from common.control import QueueFilter, positive_setting, run_filter
+from common.fruit_item import FruitItem
+from common.message_protocol import internal
+from common.processing import as_records, select_top
 
 
-class JoinFilter:
+class JoinFilter(QueueFilter):
 
     def __init__(self):
-        self.input_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, INPUT_QUEUE
-        )
-        self.output_queue = middleware.MessageMiddlewareQueueRabbitMQ(
-            MOM_HOST, OUTPUT_QUEUE
-        )
+        self.top_size = positive_setting("TOP_SIZE")
+        self.aggregation_count = positive_setting("AGGREGATION_AMOUNT")
+        self.destination = os.environ["OUTPUT_QUEUE"]
+        self.queries = {}
+        super().__init__(os.environ["MOM_HOST"], os.environ["INPUT_QUEUE"])
 
-    def process_messsage(self, message, ack, nack):
-        logging.info("Received top")
-        fruit_top = message_protocol.internal.deserialize(message)
-        self.output_queue.send(message_protocol.internal.serialize(fruit_top))
-        ack()
-
-    def start(self):
-        self.input_queue.start_consuming(self.process_messsage)
+    def process_message(self, message):
+        if message["type"] != internal.PARTIAL_TOP:
+            raise ValueError("Expected a partial top")
+        query_id = message["query_id"]
+        sender_id = message["sender_id"]
+        if sender_id >= self.aggregation_count:
+            raise ValueError("Unknown Aggregation replica")
+        candidates, senders = self.queries.setdefault(query_id, ([], set()))
+        if sender_id in senders:
+            raise ValueError("Repeated partial top from Aggregation")
+        incoming = [FruitItem(fruit, amount) for fruit, amount in message["items"]]
+        candidates = select_top(candidates + incoming, self.top_size)
+        senders.add(sender_id)
+        self.queries[query_id] = candidates, senders
+        if len(senders) == self.aggregation_count:
+            self.send(
+                self.destination,
+                internal.top(internal.RESULT, query_id, as_records(candidates)),
+            )
+            del self.queries[query_id]
+            logging.info("Published final top for query %s", query_id)
 
 
 def main():
-    logging.basicConfig(level=logging.INFO)
-    join_filter = JoinFilter()
-    join_filter.start()
-
-    return 0
+    return run_filter(JoinFilter)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
