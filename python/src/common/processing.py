@@ -1,5 +1,6 @@
 """Shared accumulation and top selection using the opaque FruitItem operators."""
 
+from abc import abstractmethod
 from heapq import nlargest
 
 from common.fruit_item import FruitItem
@@ -48,5 +49,6 @@ class AccumulatingFilter(QueueFilter):
         # Keep state until all outgoing publications have been confirmed.
         del self.queries[query_id]
 
+    @abstractmethod
     def finish_query(self, query_id, totals):
-        raise NotImplementedError
+        """Publish the completed query before its accumulated state is released."""

@@ -3,6 +3,7 @@
 import logging
 import os
 import signal
+from abc import ABC, abstractmethod
 
 from common import middleware
 from common.message_protocol import internal
@@ -19,7 +20,7 @@ def replica_queue(prefix, replica_id):
     return f"{prefix}_{replica_id}"
 
 
-class QueueFilter:
+class QueueFilter(ABC):
 
     def __init__(self, host, input_queue):
         self.transport = middleware.MessageMiddlewareQueueRabbitMQ(host, input_queue)
@@ -31,8 +32,9 @@ class QueueFilter:
         self.process_message(internal.deserialize(body))
         ack()
 
+    @abstractmethod
     def process_message(self, message):
-        raise NotImplementedError
+        """Process a validated message before the common consumer acknowledges it."""
 
     def send(self, destination, message):
         self.transport.send_to_queue(destination, internal.serialize(message))
