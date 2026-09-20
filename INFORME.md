@@ -72,3 +72,72 @@ callbacks se ejecutan secuencialmente en el proceso propietario del estado, por
 lo que no hay actualizaciones concurrentes que requieran un mutex local. Ante
 errores se registra la causa, se cierran los recursos y el control termina con
 código distinto de cero.
+
+## Coordinación de las réplicas de Sum
+
+Las réplicas consumen datos de la misma cola de entrada. Cada una mantiene sus
+acumulados por consulta y atiende además una cola de control cuyo nombre se
+deriva de `SUM_PREFIX` e `ID`. No se crean colas por cliente. La réplica que
+recibe el EOF del Gateway coordina exclusivamente el cierre de esa consulta;
+también sigue participando como trabajadora.
+
+El cierre tiene dos barreras:
+
+1. **Procesamiento:** el coordinador envía `PREPARE` a todas las Sum. Cada una
+   responde con `PROGRESS`, incluyendo su contador acumulado de registros
+   procesados, incluso si es cero. Si termina un registro después de responder,
+   envía el contador actualizado. El coordinador espera informes de todas las
+   réplicas y una suma exactamente igual al total anunciado por el Gateway.
+2. **Publicación:** el coordinador envía `FLUSH`. Cada réplica publica sus
+   parciales hacia Aggregation y, una vez confirmados por RabbitMQ, responde
+   `FLUSHED` con la cantidad de parciales. Solo cuando respondieron todas se
+   publica un único EOF hacia Aggregation con la cantidad total de parciales.
+
+```mermaid
+sequenceDiagram
+    participant G as Gateway
+    participant C as Sum que recibe EOF
+    participant S as Cada réplica Sum (incluye C)
+    participant A as Aggregation
+    G->>C: EOF(consulta, N)
+    C->>S: PREPARE(consulta, coordinador)
+    S->>C: PROGRESS(consulta, procesados)
+    opt Finaliza un registro pendiente después del informe
+        S->>C: PROGRESS(consulta, contador actualizado)
+    end
+    Note over C: Respondieron todas y suma de contadores = N
+    C->>S: FLUSH(consulta)
+    S->>A: Parciales confirmados por el broker
+    S->>C: FLUSHED(consulta, cantidad de parciales)
+    Note over C: Todas terminaron de publicar
+    C->>A: EOF(consulta, total de parciales)
+```
+
+La primera barrera no supone orden entre la cola de control y la de datos. La
+prueba de finalización se basa en los contadores. Para acotar el tráfico se usa
+que cada Gateway publica sus registros y EOF por el mismo canal y cola, sin
+prioridades, y cada consumidor de datos tiene prefetch 1 y confirma después de
+procesar. Al extraerse el EOF, los registros anteriores ya fueron entregados;
+queda a lo sumo uno pendiente por réplica. Por eso, después de `PREPARE`, cada
+réplica necesita un informe inicial y como máximo una actualización. Este
+argumento corresponde a ejecución sin fallas ni reentregas: no se implementa
+recuperación después de una desconexión.
+
+En la segunda barrera, las confirmaciones del broker establecen que todos los
+parciales llegaron a su cola antes de publicar el EOF. Aggregation tiene un
+único consumidor secuencial y recibe el marcador por esa misma cola, por lo que
+no calcula el top mientras queden parciales anteriores por procesar.
+
+Con S réplicas, el cierre requiere a lo sumo `5*S + 1` publicaciones de control
+internas por consulta: preparación, hasta dos informes de progreso, orden de
+publicación, confirmación de publicación y un EOF hacia Aggregation. Se
+excluyen el EOF original y los acknowledgements del transporte. Los mensajes
+llevan identificadores y contadores, no listas de registros ni de réplicas. El
+coordinador mantiene O(S) estado y actualiza los totales incrementalmente, sin
+recorrer todos los contadores en cada informe. Los contadores requieren una
+cantidad de dígitos proporcional al logaritmo del volumen representado.
+
+No se espera bloqueando dentro de un callback a que otras réplicas respondan.
+Cada mensaje actualiza el estado y retorna al consumo. Los datos de consultas
+distintas pueden seguir intercalándose. El estado local se elimina después de
+publicar `FLUSHED`, y el de coordinación después de publicar el EOF final.

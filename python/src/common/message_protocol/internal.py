@@ -4,6 +4,17 @@ DATA = "data"
 EOF = "eof"
 PARTIAL_TOP = "partial_top"
 RESULT = "result"
+PREPARE = "prepare"
+PROGRESS = "progress"
+FLUSH = "flush"
+FLUSHED = "flushed"
+
+_CONTROL_FIELDS = {
+    PREPARE: (),
+    PROGRESS: ("processed_records",),
+    FLUSH: (),
+    FLUSHED: ("partial_count",),
+}
 
 
 def serialize(message):
@@ -23,6 +34,10 @@ def top(message_type, query_id, items, sender_id=None):
     if sender_id is not None:
         message["sender_id"] = sender_id
     return message
+
+
+def control(message_type, query_id, sender_id, **fields):
+    return dict(type=message_type, query_id=query_id, sender_id=sender_id, **fields)
 
 
 def _require_integer(value, name, minimum=None):
@@ -47,6 +62,10 @@ def deserialize(message):
         _validate_record(fields.get("fruit"), fields.get("amount"))
     elif message_type == EOF:
         _require_integer(fields.get("total_records"), "total_records", 0)
+    elif message_type in _CONTROL_FIELDS:
+        _require_integer(fields.get("sender_id"), "sender_id", 0)
+        for name in _CONTROL_FIELDS[message_type]:
+            _require_integer(fields.get(name), name, 0)
     elif message_type in (PARTIAL_TOP, RESULT):
         items = fields.get("items")
         if not isinstance(items, list):
