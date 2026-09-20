@@ -93,6 +93,13 @@ El cierre tiene dos barreras:
    `FLUSHED` con la cantidad de parciales. Solo cuando respondieron todas se
    publica un único EOF hacia Aggregation con la cantidad total de parciales.
 
+Se trata de un protocolo de finalización con dos barreras. Si una réplica falla después de publicar algunos parciales, no se revierten esas publicaciones ni se garantiza completar la consulta.
+
+Las barreras coordinan procesos independientes mediante RabbitMQ.
+`CompletionBarrier` es el estado local que el coordinador utiliza para registrar
+los informes y comprobar las condiciones de avance. El protocolo actual permite
+seguir atendiendo mensajes mientras se esperan respuestas de otras réplicas.
+
 ```mermaid
 sequenceDiagram
     participant G as Gateway
