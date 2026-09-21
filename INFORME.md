@@ -28,11 +28,12 @@ para su método `send`.
 Ante errores de comunicación, el middleware intenta cerrar su conexión y
 propaga el error. No se implementan reconexiones ni reintentos automáticos.
 
-## Aislamiento de consultas y flujo con una réplica
+## Aislamiento de consultas y flujo de datos
 
 Cada `MessageHandler` crea un identificador de consulta antes de que el Gateway
 lo copie a sus procesos. Los mensajes internos incluyen ese identificador y un
-tipo explícito: datos, fin de registros, top parcial o resultado final. El EOF
+tipo explícito: datos, fin de registros, cierre de partición, top parcial o
+resultado final. El EOF
 del Gateway lleva la cantidad de registros enviados. El handler de respuesta
 solo devuelve los resultados de su propia consulta; devuelve `None` para las
 ajenas. Para un top vacío coincidente devuelve una lista con valor booleano
@@ -48,16 +49,18 @@ sequenceDiagram
     G->>S: DATA(consulta, fruta, cantidad)
     G->>S: EOF(consulta, cantidad de registros)
     S->>A: DATA(consulta, fruta, acumulado)
-    S->>A: EOF(consulta, cantidad de parciales)
+    S->>A: PARTITION_END(consulta), después de la barrera de publicación
     A->>J: PARTIAL_TOP(consulta, réplica, pares)
     J->>G: RESULT(consulta, pares)
 ```
 
 El diagrama resume una consulta; mensajes de consultas distintas pueden
 intercalarse. Sum y Aggregation mantienen acumulados y contadores separados por
-consulta. Con una réplica por etapa, cada EOF se procesa después de los datos de
-su consulta y se verifica su contador antes de publicar la salida. Los parciales
-y su marcador viajan por la misma cola de Aggregation, declarada antes de enviar.
+consulta. Sum verifica entre sus réplicas el total de registros de esa consulta
+anunciado en el EOF antes de publicar los
+parciales. Cada Aggregation finaliza al recibir el marcador PARTITION_END,
+publicado después de que todas las Sum confirmaron sus envíos. Los parciales y
+su marcador viajan por la misma cola de Aggregation, declarada antes de enviar.
 Cada proceso reutiliza su conexión para consumir y publicar.
 
 La acumulación utiliza `FruitItem.__add__`. Aggregation selecciona los mayores
@@ -91,7 +94,8 @@ El cierre tiene dos barreras:
 2. **Publicación:** el coordinador envía `FLUSH`. Cada réplica publica sus
    parciales hacia Aggregation y, una vez confirmados por RabbitMQ, responde
    `FLUSHED` con la cantidad de parciales. Solo cuando respondieron todas se
-   publica un único EOF hacia Aggregation con la cantidad total de parciales.
+   publica un marcador PARTITION_END hacia cada Aggregation, incluso si su
+   partición no recibió datos.
 
 Se trata de un protocolo de finalización con dos barreras. Si una réplica falla después de publicar algunos parciales, no se revierten esas publicaciones ni se garantiza completar la consulta.
 
@@ -105,7 +109,7 @@ sequenceDiagram
     participant G as Gateway
     participant C as Sum que recibe EOF
     participant S as Cada réplica Sum (incluye C)
-    participant A as Aggregation
+    participant A as Cada Aggregation
     G->>C: EOF(consulta, N)
     C->>S: PREPARE(consulta, coordinador)
     S->>C: PROGRESS(consulta, procesados)
@@ -117,7 +121,7 @@ sequenceDiagram
     S->>A: Parciales confirmados por el broker
     S->>C: FLUSHED(consulta, cantidad de parciales)
     Note over C: Todas terminaron de publicar
-    C->>A: EOF(consulta, total de parciales)
+    C->>A: PARTITION_END(consulta) a cada partición
 ```
 
 La primera barrera no supone orden entre la cola de control y la de datos. La
@@ -131,13 +135,13 @@ argumento corresponde a ejecución sin fallas ni reentregas: no se implementa
 recuperación después de una desconexión.
 
 En la segunda barrera, las confirmaciones del broker establecen que todos los
-parciales llegaron a su cola antes de publicar el EOF. Aggregation tiene un
-único consumidor secuencial y recibe el marcador por esa misma cola, por lo que
+parciales llegaron a sus colas antes de publicar los marcadores. Cada Aggregation
+tiene un único consumidor secuencial y recibe el marcador por su cola de datos, por lo que
 no calcula el top mientras queden parciales anteriores por procesar.
 
-Con S réplicas, el cierre requiere a lo sumo `5*S + 1` publicaciones de control
+Con S réplicas Sum y A Aggregation, el cierre requiere a lo sumo `5*S + A` publicaciones de control
 internas por consulta: preparación, hasta dos informes de progreso, orden de
-publicación, confirmación de publicación y un EOF hacia Aggregation. Se
+publicación, confirmación de publicación y un marcador por Aggregation. Se
 excluyen el EOF original y los acknowledgements del transporte. Los mensajes
 llevan identificadores y contadores, no listas de registros ni de réplicas. El
 coordinador mantiene O(S) estado y actualiza los totales incrementalmente, sin
@@ -147,4 +151,46 @@ cantidad de dígitos proporcional al logaritmo del volumen representado.
 No se espera bloqueando dentro de un callback a que otras réplicas respondan.
 Cada mensaje actualiza el estado y retorna al consumo. Los datos de consultas
 distintas pueden seguir intercalándose. El estado local se elimina después de
-publicar `FLUSHED`, y el de coordinación después de publicar el EOF final.
+publicar `FLUSHED`, y el de coordinación después de publicar todos los marcadores.
+
+
+## Particionado entre Aggregation y top final de la consulta
+
+Cada Sum calcula `SHA-256(fruta en UTF-8) % AGGREGATION_AMOUNT` y publica el
+parcial únicamente en la cola de ese destino. La función está en
+`common/partitioning.py` y produce el mismo resultado en todos los procesos;
+no usa el `hash()` de strings de Python, que puede variar entre intérpretes.
+No se depende de nombres de contenedores ni de un número fijo de réplicas.
+Las colas se derivan de los prefijos e identificadores configurados.
+
+Los parciales de una misma fruta y consulta siempre llegan al mismo Aggregation,
+que consolida su total antes de calcular el top. Así se elimina el procesamiento
+redundante del broadcast de datos del esqueleto. Todas las particiones pueden
+recibir trabajo; el balance depende de las frutas presentes y su distribución.
+Con pocas frutas distintas puede haber particiones vacías, y una fruta muy
+frecuente no se reparte entre varias Aggregation.
+
+El EOF del Gateway sigue llevando el número de registros originales. El cierre
+de una partición, en cambio, usa PARTITION_END sin un contador local: su validez
+proviene de la barrera de publicaciones confirmadas y del orden de la cola, no
+solo de haber recibido un mensaje de control. Esto evita transmitir desde cada
+Sum un vector de contadores por Aggregation, que requeriría O(S*A) valores. La
+cantidad total de parciales de cada consulta informada por FLUSHED se conserva
+para diagnóstico.
+
+Una partición vacía recibe igualmente PARTITION_END y envía un top vacío. Join
+espera un top por identificador de Aggregation, conserva a lo sumo TOP_SIZE
+candidatos entre recepciones y emite un resultado final por consulta. Una fruta
+que no está en el top de su partición tampoco puede entrar en el top final de
+esa consulta:
+ya existen TOP_SIZE frutas de esa partición que la preceden según el orden de
+FruitItem. Esta propiedad depende de que cada fruta tenga un único dueño.
+
+La combinación de tops parciales se realiza por `query_id`: los candidatos de
+consultas diferentes nunca se mezclan. Cada cliente recibe el top final de su
+propia consulta.
+
+Con K = TOP_SIZE, Aggregation envía como máximo A*K candidatos a Join por
+consulta. El estado de Join es O(K+A), incluyendo el conjunto de emisores; el
+control del cierre entre Sum y Aggregation es O(S+A). No se crean conexiones por
+cada pareja de réplicas: las publicaciones reutilizan la conexión del proceso.
