@@ -10,6 +10,8 @@ class AggregationFilter(AccumulatingFilter):
 
     def __init__(self):
         self.replica_id = int(os.environ["ID"])
+        if not 0 <= self.replica_id < positive_setting("AGGREGATION_AMOUNT"):
+            raise ValueError("Aggregation ID is outside the configured replica range")
         self.top_size = positive_setting("TOP_SIZE")
         self.destination = os.environ["OUTPUT_QUEUE"]
         input_queue = replica_queue(os.environ["AGGREGATION_PREFIX"], self.replica_id)
@@ -22,7 +24,10 @@ class AggregationFilter(AccumulatingFilter):
             self.destination,
             internal.top(internal.PARTIAL_TOP, query_id, items, self.replica_id),
         )
-        logging.info("Published partial top for query %s", query_id)
+        logging.info(
+            "Aggregation %s published query %s: %s fruits, %s top entries",
+            self.replica_id, query_id, len(totals.by_fruit), len(items),
+        )
 
 
 def main():

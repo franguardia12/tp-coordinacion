@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from common.control import QueueFilter, positive_setting, replica_queue, run_filter
 from common.message_protocol import internal
+from common.partitioning import fruit_partition
 from common.processing import FruitTotals
 from coordination import CompletionBarrier
 
@@ -21,16 +22,18 @@ class SumFilter(QueueFilter):
         self.replica_id = int(os.environ["ID"])
         if not 0 <= self.replica_id < self.replica_count:
             raise ValueError("Sum ID is outside the configured replica range")
-        if positive_setting("AGGREGATION_AMOUNT") != 1:
-            raise ValueError("Multiple Aggregation replicas require partitioning")
+        self.aggregation_count = positive_setting("AGGREGATION_AMOUNT")
         self.control_prefix = os.environ["SUM_PREFIX"]
-        self.destination = replica_queue(os.environ["AGGREGATION_PREFIX"], 0)
+        self.aggregation_prefix = os.environ["AGGREGATION_PREFIX"]
         self.queries = {}
         self.barriers = {}
         super().__init__(os.environ["MOM_HOST"], os.environ["INPUT_QUEUE"])
 
     def control_queue(self, replica_id):
         return f"{replica_queue(self.control_prefix, replica_id)}_control"
+
+    def aggregation_queue(self, replica_id):
+        return replica_queue(self.aggregation_prefix, replica_id)
 
     def start(self):
         self.transport.register_consumer(
@@ -116,7 +119,11 @@ class SumFilter(QueueFilter):
         if query.coordinator_id != message["sender_id"]:
             raise ValueError("Flush requested by a different coordinator")
         for item in query.totals.by_fruit.values():
-            self.send(self.destination, internal.data(query_id, item.fruit, item.amount))
+            partition = fruit_partition(item.fruit, self.aggregation_count)
+            self.send(
+                self.aggregation_queue(partition),
+                internal.data(query_id, item.fruit, item.amount),
+            )
         # Every partial is broker-confirmed before this report is published.
         self._send_control(
             query.coordinator_id, internal.FLUSHED, query_id,
@@ -133,10 +140,17 @@ class SumFilter(QueueFilter):
         query_id = message["query_id"]
         barrier = self.barriers[query_id]
         if barrier.record_publication(message["sender_id"], message["partial_count"]):
-            # All producers finished before the marker enters the data queue.
-            self.send(self.destination, internal.eof(query_id, barrier.partial_count))
+            # All producers finished before any marker enters a partition queue.
+            # Empty partitions also need a marker so they can send an empty top.
+            for replica_id in range(self.aggregation_count):
+                self.send(
+                    self.aggregation_queue(replica_id), internal.partition_end(query_id)
+                )
             del self.barriers[query_id]
-            logging.info("Closed Sum stage for query %s", query_id)
+            logging.info(
+                "Closed Sum stage for query %s: %s partials across %s partitions",
+                query_id, barrier.partial_count, self.aggregation_count,
+            )
 
 
 def main():

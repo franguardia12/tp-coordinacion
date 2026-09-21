@@ -37,14 +37,14 @@ class AccumulatingFilter(QueueFilter):
     def process_message(self, message):
         query_id = message["query_id"]
         message_type = message["type"]
-        if message_type not in (internal.DATA, internal.EOF):
-            raise ValueError("Expected data or end of records")
+        if message_type not in (internal.DATA, internal.PARTITION_END):
+            raise ValueError("Expected data or end of partition")
         totals = self.queries.setdefault(query_id, FruitTotals())
         if message_type == internal.DATA:
             totals.add(message["fruit"], message["amount"])
             return
-        if totals.record_count != message["total_records"]:
-            raise ValueError(f"Record count mismatch for query {query_id}")
+        # A single consumer processes this queue in order. The coordinator sends
+        # PARTITION_END only after every Sum's publications have been confirmed.
         self.finish_query(query_id, totals)
         # Keep state until all outgoing publications have been confirmed.
         del self.queries[query_id]

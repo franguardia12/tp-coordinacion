@@ -2,6 +2,7 @@ import json
 
 DATA = "data"
 EOF = "eof"
+PARTITION_END = "partition_end"
 PARTIAL_TOP = "partial_top"
 RESULT = "result"
 PREPARE = "prepare"
@@ -27,6 +28,10 @@ def data(query_id, fruit, amount):
 
 def eof(query_id, total_records):
     return dict(type=EOF, query_id=query_id, total_records=total_records)
+
+
+def partition_end(query_id):
+    return dict(type=PARTITION_END, query_id=query_id)
 
 
 def top(message_type, query_id, items, sender_id=None):
@@ -62,6 +67,9 @@ def deserialize(message):
         _validate_record(fields.get("fruit"), fields.get("amount"))
     elif message_type == EOF:
         _require_integer(fields.get("total_records"), "total_records", 0)
+    elif message_type == PARTITION_END:
+        # The publication barrier orders this marker after all partition data.
+        return fields
     elif message_type in _CONTROL_FIELDS:
         _require_integer(fields.get("sender_id"), "sender_id", 0)
         for name in _CONTROL_FIELDS[message_type]:
