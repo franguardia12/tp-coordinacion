@@ -175,16 +175,17 @@ Aggregation se envía un parcial por fruta presente en cada Sum: como máximo
 | Candidatos y emisores de Join | O(K+A) |
 
 El prefetch limita los mensajes entregados pendientes de ack, pero no limita
-los acumulados ni los mensajes que pueden esperar en el broker. Actualmente,
-si crecen F o C, los diccionarios en memoria también crecen; **todavía no hay un
-límite de memoria independiente de esos tamaños**.
+los acumulados ni los mensajes que pueden esperar en el broker. Si crecen F o C,
+los diccionarios en memoria también crecen: no hay un límite de memoria
+independiente de esos tamaños. Se conserva el almacenamiento en memoria por
+simplicidad.
 
 Además, `_flush()` publica todos los acumulados de una consulta dentro de un
 callback, y la selección del top recorre sus frutas. Con muchos elementos estas
 tareas pueden demorar la atención de otras consultas y de eventos de conexión.
-Quedan pendientes almacenamiento de acumulados con memoria acotada y ejecución
-por porciones de las tareas extensas. Son cambios necesarios para completar
-este aspecto de la solución; el paso de los escenarios pequeños no lo demuestra.
+La ejecución por porciones de las tareas extensas es una posible mejora para
+reducir esa demora. El paso de los escenarios provistos no demuestra capacidad
+para volúmenes arbitrariamente grandes.
 
 ### 4.3. Cantidad de controles
 
