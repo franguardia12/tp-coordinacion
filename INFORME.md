@@ -82,9 +82,13 @@ tras confirmar `FLUSHED`, y el del coordinador tras publicar los marcadores.
 
 ### 3.1. Distribución de responsabilidades
 
-Cada Sum calcula `SHA-256(fruta en UTF-8) % AGGREGATION_AMOUNT` y publica el
+Cada Sum calcula `FNV-1a de 32 bits(fruta en UTF-8) % AGGREGATION_AMOUNT` y publica el
 parcial en la cola de ese destino. La función es estable entre procesos; no se
-usa el `hash()` de strings de Python. Todos los parciales de una fruta y consulta
+usa el `hash()` de strings de Python. FNV-1a es no criptográfico: recorre los
+bytes de la fruta, aplica XOR y multiplica por una constante, conservando 32 bits.
+Las constantes del algoritmo están nombradas en `common/partitioning.py`.
+Se sigue la [descripción de FNV-1a](https://www.ietf.org/archive/id/draft-eastlake-fnv-35.html#section-2).
+Todos los parciales de una fruta y consulta
 llegan a un único Aggregation, evitando el broadcast de datos.
 Los nombres de colas se derivan de los prefijos e identificadores configurados.
 
