@@ -5,6 +5,8 @@
 La solución en Python conserva el recorrido Gateway → Sum → Aggregation → Join
 → Gateway. Cada réplica corre en un proceso independiente. Los controles usan
 RabbitMQ para intercambiar datos y coordinar su finalización.
+Se conserva una cola compartida entre Gateway y las Sum y una cola de resultados
+que consume el Gateway. Las colas adicionales son internas a la coordinación.
 
 `MessageHandler` crea un `query_id` antes de que el Gateway lo copie a sus
 procesos. Ese identificador acompaña todos los mensajes internos. Sum y
@@ -73,6 +75,12 @@ como máximo uno pendiente por consumidor de datos. Cada Sum necesita entonces
 un informe inicial y como máximo una actualización. Este razonamiento supone
 la ejecución sin fallas ni reentregas.
 
+El prefetch acota la cantidad de informes, no decide cuándo termina una consulta.
+Si hubiera varios registros pendientes, cada uno actualizaría el contador y la
+barrera seguiría esperando el total anunciado. No se reencola el EOF ni se usan
+timeouts para declarar el final. El coordinador reúne contadores y confirmaciones;
+los parciales de las demás Sum van directamente a Aggregation.
+
 Los informes actualizan el total por diferencia, sin recorrer todas las réplicas
 en cada recepción. Los callbacks no esperan bloqueando las respuestas de otros
 procesos: actualizan el estado y retornan al consumo. El estado local se libera
@@ -82,14 +90,15 @@ tras confirmar `FLUSHED`, y el del coordinador tras publicar los marcadores.
 
 ### 3.1. Distribución de responsabilidades
 
-Cada Sum calcula `FNV-1a de 32 bits(fruta en UTF-8) % AGGREGATION_AMOUNT` y publica el
+Cada Sum calcula `FNV1a32(fruta en UTF-8) % AGGREGATION_AMOUNT` y publica el
 parcial en la cola de ese destino. La función es estable entre procesos; no se
 usa el `hash()` de strings de Python. FNV-1a es no criptográfico: recorre los
 bytes de la fruta, aplica XOR y multiplica por una constante, conservando 32 bits.
 Las constantes del algoritmo están nombradas en `common/partitioning.py`.
 Se sigue la [descripción de FNV-1a](https://www.ietf.org/archive/id/draft-eastlake-fnv-35.html#section-2).
-Todos los parciales de una fruta y consulta
-llegan a un único Aggregation, evitando el broadcast de datos.
+Todos los parciales de una fruta y consulta llegan a un único Aggregation,
+evitando el broadcast de datos. Frutas diferentes pueden compartir partición:
+los acumulados se identifican por el nombre completo y por la consulta.
 Los nombres de colas se derivan de los prefijos e identificadores configurados.
 
 Las Aggregation no necesitan intercambiar mensajes entre sí: cada una es
@@ -225,7 +234,13 @@ en el proceso dueño del estado, sin acceso concurrente que requiera mutex local
 
 La lógica común está en `common/processing.py` y `common/control.py`; las clases
 base declaran explícitamente sus métodos abstractos. Sum, Aggregation y Join
-manejan SIGTERM/SIGINT, cierran sus recursos y registran los errores. Ante una
-falla de comunicación se intenta cerrar y se propaga el error, sin reconexiones
+manejan SIGTERM/SIGINT, cierran sus recursos y registran los errores. El handler
+interrumpe el procesamiento mediante una excepción interna que conduce a la
+limpieza síncrona y la salida del proceso. No espera completar la consulta ni
+notifica a otros controllers; estos pueden quedar esperando mensajes del nodo
+detenido. Los handlers se instalan después de construir el controller: la
+inicialización previa no está cubierta por este mecanismo de cierre.
+
+Ante una falla de comunicación se intenta cerrar y se propaga el error, sin reconexiones
 ni reintentos automáticos. No se garantiza completar ni revertir una consulta
 interrumpida.
